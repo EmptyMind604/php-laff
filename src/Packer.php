@@ -4,6 +4,11 @@ namespace Cloudstek\PhpLaff;
 
 use OutOfRangeException;
 
+define('LENGTH',0);
+define('WIDTH',1);
+define('HEIGHT',2);
+define('DEFAULT_MAXHEIGHT',1000);
+
 /**
  * Largest Area Fit First (LAFF) 3D box packing algorithm class
  *
@@ -19,6 +24,7 @@ class Packer
      * @var array
      */
     private $boxes = null;
+    private $boxes_init = null;
 
     /**
      * Array of boxes that have been packed
@@ -27,12 +33,19 @@ class Packer
      */
     private $packed_boxes = null;
 
+    private $overflow = null;
+
+    private $spaces_index = null;
+
+    private $name_list = null;
+
     /**
      * Current level we're packing (0 based index)
      *
      * @var int
      */
     private $level = -1;
+    private $depth = 0;
 
     /**
      * Current container dimensions
@@ -40,7 +53,7 @@ class Packer
      * @var array
      */
     private $container_dimensions = null;
-
+    private $containerId = null;
     /**
      * Constructor of the BoxPacking class
      *
@@ -51,8 +64,10 @@ class Packer
     {
         if (isset($boxes) && is_array($boxes)) {
             $this->boxes        = $boxes;
+            $this->boxes_init = $boxes;
             $this->packed_boxes = array();
-
+            $this->overflow = [];
+            $this->spaces_index = [];
             // Calculate container size
             if (!is_array($container)) {
                 $this->container_dimensions = $this->_calc_container_dimensions();
@@ -71,6 +86,7 @@ class Packer
 
                     // Note: do NOT set height, it will be calculated on-the-go
                     $this->container_dimensions['height'] = 0;
+                    $this->container_dimensions['max_height'] = $container['height'] ?: DEFAULT_MAXHEIGHT;
                 }
             }
         }
@@ -89,6 +105,8 @@ class Packer
             $this->packed_boxes         = array();
             $this->level                = -1;
             $this->container_dimensions = null;
+            $this->overflow = [];
+            $this->spaces_index = [];
 
             // Calculate container size
             if (!is_array($container)) {
@@ -104,6 +122,7 @@ class Packer
 
                 // Note: do NOT set height, it will be calculated on-the-go
                 $this->container_dimensions['height'] = 0;
+                $this->container_dimensions['max_height'] = $container['height'] ?: DEFAULT_MAXHEIGHT;
             }
         }
 
@@ -112,6 +131,10 @@ class Packer
         }
 
         $this->pack_level();
+    }
+
+    public function get_overflow(){
+        return $this->overflow;
     }
 
     /**
@@ -134,6 +157,27 @@ class Packer
         return $this->packed_boxes;
     }
 
+    public function get_spaces_index(){
+        return $this->spaces_index;
+    }
+
+    public function get_name_list(){
+        return $this->name_list;
+    }
+
+    public function get_item_name($item_id) {
+        if (isset($this->name_list[$item_id])) {
+            return $this->name_list[ $item_id ];
+        } else {
+            return '';
+        }
+    }
+
+    public function set_name_list(array $name_list){
+        $this->name_list = $name_list;
+    }
+
+
     /**
      * Get container dimensions
      *
@@ -149,13 +193,27 @@ class Packer
      *
      * @return float
      */
-    public function get_container_volume()
+    public function get_container_volume($useMax = 0)
     {
         if (!isset($this->container_dimensions)) {
             return 0;
         }
-
+        if ($useMax === 1) {
+            return $this->_get_volume([
+            'length' => $this->container_dimensions['length'],
+            'width' => $this->container_dimensions['width'],
+            'height' => $this->container_dimensions['max_height']
+            ]);
+        }
         return $this->_get_volume($this->container_dimensions);
+    }
+
+    public function get_container_id() {
+        return $this->containerId;
+    }
+
+    public function set_container_id($containerId) {
+        $this->containerId = $containerId;
     }
 
     /**
@@ -188,6 +246,10 @@ class Packer
         }
 
         return $volume;
+    }
+
+    public function get_free_volume($useMax = 0){
+        return $this->get_container_volume($useMax) - $this->get_packed_volume();
     }
 
     /**
@@ -274,6 +336,14 @@ class Packer
         );
     }
 
+    public function _calc_max_height($boxes){
+        $max_height = 0;
+        foreach ($boxes as $k => $box) {
+            $max_height += max(array_values($box));
+        }
+        return $max_height;
+    }
+
     /**
      * Calculate container dimensions
      *
@@ -285,7 +355,8 @@ class Packer
             return array(
                 'length' => 0,
                 'width'  => 0,
-                'height' => 0
+                'height' => 0,
+                'max_height' => DEFAULT_MAXHEIGHT
             );
         }
 
@@ -299,11 +370,13 @@ class Packer
 
         // Re-iterate and get longest edge now (second longest)
         $sle = $this->_calc_longest_edge($boxes, $edges);
+        $max_height = $this->_calc_max_height($boxes);
 
         return array(
             'length' => $le['edge_size'],
             'width'  => $sle['edge_size'],
-            'height' => 0
+            'height' => 0,
+            'max_height' => $max_height
         );
     }
 
@@ -329,6 +402,28 @@ class Packer
         return $array;
     }
 
+
+    public function _rotate($box){
+        $rotated[LENGTH] = $box[WIDTH];
+        $rotated[WIDTH] = $box[LENGTH];
+        $rotated[HEIGHT] = $box[HEIGHT];
+        return $rotated;
+    }
+
+    public function _flip($box){
+        $rotated[HEIGHT] = $box[LENGTH];
+        $rotated[LENGTH] = $box[HEIGHT];
+        $rotated[WIDTH] = $box[WIDTH];
+        return $rotated;
+    }
+
+    public function _flip2($box){
+        $rotated[HEIGHT] = $box[WIDTH];
+        $rotated[WIDTH] = $box[HEIGHT];
+        $rotated[LENGTH] = $box[LENGTH];
+        return $rotated;
+    }
+
     /**
      * Utility function that returns the total volume of a box / container
      *
@@ -343,8 +438,7 @@ class Packer
         }
 
         $box = array_filter($box, 'strlen');
-        
-        return (isset($box['length'])?$box['length']:$box[0]) * (isset($box['width'])?$box['width']:$box[1]) * (isset($box['height'])?$box['height']:$box[2]);;
+        return (isset($box['length'])?$box['length']:$box[0]) * (isset($box['width'])?$box['width']:$box[1]) * (isset($box['height'])?$box['height']:$box[2]);
     }
 
     /**
@@ -358,11 +452,11 @@ class Packer
     private function _try_fit_box($box, $space)
     {
         if (count($box) < 3) {
-            throw new \InvalidArgumentException("_try_fit_box function parameter $box only accepts arrays with 3 values (length, width, height)");
+            throw new \InvalidArgumentException("_try_fit_box function parameter \$box only accepts arrays with 3 values (length, width, height)");
         }
 
         if (count($space) < 3) {
-            throw new \InvalidArgumentException("_try_fit_box function parameter $space only accepts arrays with 3 values (length, width, height)");
+            throw new \InvalidArgumentException("_try_fit_box function parameter \$space only accepts arrays with 3 values (length, width, height)");
         }
 
         for ($i = 0; $i < count($box); $i++) {
@@ -389,12 +483,36 @@ class Packer
     {
         $box   = array_values($box);
         $space = array_values($space);
+        $fits = [];
 
         if ($this->_try_fit_box($box, $space)) {
-            return true;
+            $fits[] = $box;
         }
 
-        for ($i = 0; $i < count($box); $i++) {
+        if ($this->_try_fit_box($this->_rotate($box), $space)) {
+            $fits[] = $this->_rotate($box);
+        }
+
+        if ($this->_try_fit_box($this->_flip($box), $space)) {
+            $fits[] = $this->_flip($box);
+        }
+
+        if ($this->_try_fit_box($this->_flip2($box), $space)) {
+            $fits[] = $this->_flip2($box);
+        }
+        if (count($fits) > 0) {
+            // find shortest 'fit'.
+            $shortest = $fits[0];
+            foreach ( $fits as $key => $box ) {
+                if ( $box[HEIGHT] < $shortest[HEIGHT] ) {
+                    $shortest = $box;
+                }
+            }
+            return $shortest;
+        }
+
+
+        /*for ($i = 0; $i < count($box); $i++) {
             // Temp box size
             $t_box = $box;
 
@@ -410,7 +528,7 @@ class Packer
             if ($this->_try_fit_box($s_box, $space)) {
                 return true;
             }
-        }
+        }*/
 
         return false;
     }
@@ -420,13 +538,18 @@ class Packer
      */
     private function pack_level()
     {
-        $biggest_box_index = null;
-        $biggest_surface   = 0;
+
 
         $this->level++;
 
+        do {
+        $biggest_box_index = null;
+        $biggest_surface   = 0;
         // Find biggest (widest surface) box with minimum height
         foreach ($this->boxes as $k => $box) {
+                if (!isset($this->boxes[$k])) {
+                    continue;
+                }
             $surface = $box['length'] * $box['width'];
 
             if ($surface > $biggest_surface) {
@@ -441,8 +564,39 @@ class Packer
 
         // Get biggest box as object
         $biggest_box                        = $this->boxes[$biggest_box_index];
-        $this->packed_boxes[$this->level][] = $biggest_box;
 
+            //Check if biggest box will fit in container
+            /*if (
+                ( $biggest_box[ 'width' ] > $this->container_dimensions[ 'width' ] ) || ( $biggest_box[ 'length' ] > $this->container_dimensions[ 'length' ] )
+                &&
+                ( $biggest_box[ 'width' ] > $this->container_dimensions[ 'length' ] ) || ( $biggest_box[ 'length' ] > $this->container_dimensions[ 'width' ] )
+            ) {
+                throw( new OutOfRangeException( "Item will not fit in container " . __LINE__ ) );
+            }*/
+            //print_r($this->container_dimensions);
+            $init_space = [
+                'length' => $this->container_dimensions[ 'length' ],
+                'width' => $this->container_dimensions[ 'width' ],
+                'height' => $this->container_dimensions[ 'max_height' ] - $this->container_dimensions[ 'height' ]
+            ];
+            //print_r($biggest_box);
+            $f_box = $this->_box_fits( $biggest_box, $init_space );
+            if ( $f_box === false ) {
+                $this->overflow[$biggest_box_index] = $biggest_box;
+                unset($this->boxes[$biggest_box_index]);
+                if (count($this->boxes) == 0) {
+                    return;
+                }
+            }
+        } while ( $f_box === false );
+
+        $biggest_box = [
+            'length' => $f_box[LENGTH],
+            'width' => $f_box[WIDTH],
+            'height' => $f_box[HEIGHT]
+        ];
+        $this->spaces_index[$this->level][$biggest_box_index] = $init_space;
+        $this->packed_boxes[$this->level][$biggest_box_index] = $biggest_box;
         // Set container height (ck = ck + ci)
         $this->container_dimensions['height'] += $biggest_box['height'];
 
@@ -498,25 +652,31 @@ class Packer
      */
     private function _fill_space($space)
     {
+        $this->depth++;
 
         // Total space volume
         $s_volume = $this->_get_volume($space);
 
         $fitting_box_index  = null;
         $fitting_box_volume = null;
+        $fitting_space = null;
 
         foreach ($this->boxes as $k => $box) {
             // Skip boxes that have a higher volume than target space
             if ($this->_get_volume($box) > $s_volume) {
                 continue;
             }
-
-            if ($this->_box_fits($box, $space)) {
-                $b_volume = $this->_get_volume($box);
-
+            $f_box = $this->_box_fits($box, $space);
+            if ($f_box !== false) {
+                $b_volume = $this->_get_volume($f_box);
+                $this->boxes[$k]['length'] = $f_box[LENGTH];
+                $this->boxes[$k]['width'] = $f_box[WIDTH];
+                $this->boxes[$k]['height'] = $f_box[HEIGHT];
                 if (!isset($fitting_box_volume) || $b_volume > $fitting_box_volume) {
                     $fitting_box_index  = $k;
                     $fitting_box_volume = $b_volume;
+                    $fitting_space = $space;
+                    $fitting_space['depth'] = $this->depth;
                 }
             }
         }
@@ -525,7 +685,8 @@ class Packer
             $box = $this->boxes[$fitting_box_index];
 
             // Pack box
-            $this->packed_boxes[$this->level][] = $this->boxes[$fitting_box_index];
+            $this->spaces_index[$this->level][$fitting_box_index] = $fitting_space;
+            $this->packed_boxes[$this->level][$fitting_box_index] = $this->boxes[$fitting_box_index];
             unset($this->boxes[$fitting_box_index]);
 
             // Calculate remaining space left (in current space)
@@ -553,5 +714,6 @@ class Packer
                 }
             }
         }
+        $this->depth--;
     }
 }
